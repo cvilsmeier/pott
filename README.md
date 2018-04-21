@@ -1,5 +1,8 @@
 
-# Pott DB
+# Pott
+
+[![GoDoc](https://godoc.org/github.com/cvilsmeier/pott?status.svg)](https://godoc.org/github.com/cvilsmeier/pott)
+
 
 Pott is an append-only JSON data store in pure Go.  It's well suited for
 apps that hold all data in memory and have fewer than 1 millon datasets.
