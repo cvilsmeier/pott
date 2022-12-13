@@ -1,93 +1,112 @@
-
-# Pott
+Pott
+===============================================================================
 
 [![GoDoc](https://godoc.org/github.com/cvilsmeier/pott?status.svg)](https://godoc.org/github.com/cvilsmeier/pott)
 
-
-Pott is an append-only JSON data store in pure Go.  It's well suited for
+Pott is an append-only data store in Go. It's well suited for
 apps that hold all data in memory and have fewer than 1 millon datasets.
 
 It stores data in a text file that is appended line-by-line:
 
-    todos 0 {"id":"0","text":"Fix Documentation"}
-    todos 1 {"id":"1","text":"Prepare README file"}
-    todos 2 {"id":"2","text":"Build Binary"}
-    todos 3 {"id":"3","text":"Ship"}
-    todos 2 {"id":"2","text":"Build Release Binary"}
-    todos 2
+    todos 0 {"text":"Fix Documentation", "done":false}
+    todos 1 {"text":"Prepare README file", "done":false}
+    todos 2 {"text":"Ship", "done":false}
+    -
+    todos 0 {"text":"Fix Documentation", "done":true}
+    todos 1 {"text":"Prepare README file", "done":true}
+    -
+    todos 0
+    -
 
-The first column is the 'silo' ('table' in SQL), indicating the type of the
-encoded JSON. The second column is a unique key for that data line. The third
-column is the data object, encoded as JSON. if the third column is empty, 
-that object was deleted. In the sample above, todo 2 was deleted.
+The first column is the record type.
+The second column is a unique id for that record.
+The third column is the data, for example a JSON string.
+If the third column is empty, that record was deleted.
+In the sample above, todo 0 was deleted.
 
-Each time an object is inserted, updated or deleted, pott will append a line to
-its file. After a while, unused lines will accumulate. Pott provides a command
-line tool to report file statistics (how many lines in total, how many lines
-are actually used), and to compact a pott file. Compaction removes all unused
+Lines consisting only of `-` are transaction boundaries.
+
+Each time a record is inserted, updated or deleted, pott will append a line to
+its file. After a while, unused lines will accumulate. Pott provides a 
+tool to compact a data file. Compaction removes all unused
 lines from the file.
 
-A sample command line app (pott-todo) is included to demonstrate the pott API.
-
-Pott is durable, as it writes to a file. However: If the process of writing to
+Pott files are durable. However: If the process of writing to
 the file is unexpectedly interrupted (e.g. power loss), the file may get
 corrupted and must manually be fixed again.
 
-A Pott instance is safe to be used concurrently by multiple goroutines.
-However, if two pott instances write to the same file, file corruptions may
-occur. Pott does not use file-locking mechanisms, as RMDBS systems do.
+Pott does not use file-locking mechanisms, synchronization has to be done
+by the caller.
 
 
 
 ## Usage
 
-In pott, every object is restored at startup time. A restore function must be
-supplied that unmarshals JSON strings into domain objects, as shown here:
+    go get github.com/cvilsmeier/pott
+
 
 ```go
-import (
-    "encoding/json"
+package main
 
-    "pott"
+import (
+	"encoding/json"
+	"log"
+	"os"
+
+	"github.com/cvilsmeier/pott"
 )
 
 type Todo struct {
-    Id string
-    Text string
+	Id   string `json:"id"`
+	Text string `json:"text"`
+	Done bool   `json:"done"`
 }
 
 func main() {
-    todos := []Todo{}
-    // restore todos from file "my_data"
-    restoreFn := func(silo, key string, jsonData []byte) error {
-        if silo == "todos" {
-            // unmarshal Todo JSON
-            x := Todo{}
-            err := json.Unmarshal(jsonData, &x)
-            if err != nil {
-                return err
-            }
-            todos = append(todos, x)
-            return nil
-        }
-        return nil // silently ignore all unknown silos
-    }
-    db, err := pott.Open("my_data", restoreFn)
-    check(err)
-    
-    // insert a todo
-    todo := Todo{
-        Id: uuid(),
-        Text: "Some new Todo item",
-    }
-    err := db.Save("todos", todo.Id, todo)
-    check(err)
-
-    // delete a todo by updating it to 'nil'
-    firstId := todos[0].Id
-    err := db.Save("todos", firstId, nil)
-    check(err)
+	filename := "/tmp/todos"
+	log.Printf("using %s", filename)
+	os.Remove(filename)
+	// insert some todos
+	pott.MustAppend(filename, []pott.Record{
+		{Typ: "todo", Id: "0", Data: mustMarshal(Todo{"0", "Write Documentation", false})},
+		{Typ: "todo", Id: "1", Data: mustMarshal(Todo{"1", "Ship Binary", false})},
+		{Typ: "todo", Id: "2", Data: mustMarshal(Todo{"2", "Install", false})},
+	})
+	// update todo 0 and delete todo 2
+	pott.MustAppend(filename, []pott.Record{
+		{Typ: "todo", Id: "0", Data: mustMarshal(Todo{"0", "Write Documentation", true})},
+		{Typ: "todo", Id: "2", Data: ""},
+	})
+	// read todos
+	records := pott.MustRead(filename)
+	for _, rec := range records {
+		if rec.Typ == "todo" {
+			var todo Todo
+			mustUnmarshal(rec.Data, &todo)
+			if todo.Done {
+				log.Printf("Done: %s", todo.Text)
+			} else {
+				log.Printf("Todo: %s", todo.Text)
+			}
+		}
+	}
 }
+
+func mustMarshal(todo Todo) string {
+	data, err := json.Marshal(todo)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
+func mustUnmarshal(data string, v any) {
+	err := json.Unmarshal([]byte(data), v)
+	if err != nil {
+		panic(err)
+	}
+}
+
 ```
 
 ## Author
@@ -121,5 +140,3 @@ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 
 For more information, please refer to <http://unlicense.org/>
-
-

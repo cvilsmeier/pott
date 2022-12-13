@@ -2,268 +2,161 @@ package pott
 
 import (
 	"bufio"
-	"encoding/json"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
-	"sync"
 )
 
-type Stat struct {
-	TotalLines int
-	UsedLines  int
+type Record struct {
+	Typ  string
+	Id   string
+	Data string
 }
 
-type RestoreFunc func(silo, key string, jsonData []byte) error
+// typ => id => data
+type typeIdMap map[string]map[string]string
 
-type Pott interface {
-	Save(silo, key string, x interface{}) error
-	Stat() (*Stat, error)
-	Compact() error
-	CompactTo(filename string) error
-}
-
-func Open(filename string, restoreFn RestoreFunc) (Pott, error) {
-	if filename == "" {
-		db := &memPott{}
-		return db, nil
-	}	
-	fd, err := loadFileData(filename)
+func MustRead(filename string) []Record {
+	records, err := Read(filename)
 	if err != nil {
+		panic(err)
+	}
+	return records
+}
+
+func Read(filename string) ([]Record, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
-	if restoreFn != nil {
-		for silo, datas := range fd.silos {
-			for key, data := range datas {
-				err := restoreFn(silo, key, []byte(data))
-				if err != nil {
-					return nil, err
+	defer f.Close()
+	return parse(f)
+}
+
+func parse(r io.Reader) ([]Record, error) {
+	timap := make(typeIdMap)
+	var tx []Record
+	sca := bufio.NewScanner(r)
+	for sca.Scan() {
+		line := sca.Text()
+		if line == "" {
+			// ignore empty lines
+		} else if line == "-" {
+			// apply tx to records
+			for _, rec := range tx {
+				imap := timap[rec.Typ]
+				if imap == nil {
+					imap = make(map[string]string)
+					timap[rec.Typ] = imap
+				}
+				if rec.Data == "" {
+					// delete
+					delete(imap, rec.Id)
+				} else {
+					// add
+					imap[rec.Id] = rec.Data
 				}
 			}
-		}
-	}
-	return &filePott{
-		filename: filename,
-	}, nil
-}
-
-// ------------------------------------------
-
-type memPott struct {
-}
-
-func (this *memPott) Save(silo, key string, x interface{}) error {
-	verifySiloAndKey(silo, key)
-	_, err := marshal(x)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (this *memPott) Stat() (*Stat, error) {
-	return &Stat{}, nil
-}
-
-func (this *memPott) Compact() error {
-	return nil
-}
-
-func (this *memPott) CompactTo(filename string) error {
-	return nil
-}
-
-// ------------------------------------------
-
-type filePott struct {
-	mu   sync.Mutex
-	filename string
-	previousErr error
-}
-
-func (this *filePott) Save(silo, key string, x interface{}) error {
-	verifySiloAndKey(silo, key)
-	data, err := marshal(x)
-	if err != nil {
-		return err
-	}
-	// build line to append
-	line := buildLine(silo, key, data)
-	// append line to file
-	this.mu.Lock()
-	defer this.mu.Unlock()
-	if this.previousErr != nil {
-		return fmt.Errorf("cannot save, have previous error: %s", this.previousErr)
-	}
-	file, err := os.OpenFile(this.filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	_, err = file.Write([]byte(line))
-	if err != nil {
-		this.previousErr = err
-		return err
-	}
-	return nil
-}
-
-func (this *filePott) Stat() (*Stat, error) {
-	this.mu.Lock()
-	defer this.mu.Unlock()
-	fd, err := loadFileData(this.filename)
-	if err != nil {
-		return nil, err
-	}
-	usedLines := 0
-	for _, datas := range fd.silos {
-		usedLines += len(datas)
-	}
-	return &Stat{
-		TotalLines: fd.lineCount,
-		UsedLines:  usedLines,
-	}, nil
-}
-
-func (this *filePott) Compact() error {
-	return this.CompactTo(this.filename)
-}
-
-func (this *filePott) CompactTo(destname string) error {
-	this.mu.Lock()
-	defer this.mu.Unlock()
-	// load file
-	fd, err := loadFileData(this.filename)
-	if err != nil {
-		return err
-	}
-	// open dest file
-	dest, err := os.Create(destname)
-	if err != nil {
-		return err
-	}
-	defer dest.Close()
-	writer := bufio.NewWriter(dest)
-	defer writer.Flush()
-	// sort silos
-	silos := make([]string, 0, len(fd.silos))
-	for silo, _ := range fd.silos {
-		silos = append(silos, silo)
-	}
-	sort.Strings(silos)
-	for _, silo := range silos {
-		datas := fd.silos[silo]
-		// sort keys
-		keys := make([]string, 0, len(datas))
-		for key, _ := range datas {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			data := datas[key]
-			line := buildLine(silo, key, data)
-			_, err = writer.WriteString(line)
+			tx = tx[:0]
+		} else {
+			rec, err := parseRecord(line)
 			if err != nil {
-				return err
+				return nil, err
 			}
+			tx = append(tx, rec)
 		}
 	}
-	return nil
-}
-
-// -------------------------------------------------
-
-type fileData struct {
-	lineCount int
-	silos     map[string]map[string]string
-}
-
-func loadFileData(filename string) (*fileData, error) {
-	if _, err := os.Stat(filename); os.IsNotExist(err) {
-		// file does not exist
-		return &fileData{}, nil
-	}
-	file, err := os.Open(filename)
+	err := sca.Err()
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
-	silos := map[string]map[string]string{}
-	scanner := bufio.NewScanner(file)
-	lineCount := 0
-	for scanner.Scan() {
-		lineCount++
-		text := scanner.Text()
-		var siloAndKey string
-		var data string
-		i := strings.IndexByte(text, '{')
-		if i > 0 {
-			// silo key {}
-			siloAndKey = text[:i-1]
-			data = text[i:]
-		} else {
-			// silo key
-			siloAndKey = text
-		}
-		i = strings.IndexByte(siloAndKey, ' ')
-		var silo string
-		var key string
-		if i > 0 {
-			silo = siloAndKey[:i]
-			key = siloAndKey[i+1:]
-		} else {
-			return nil, fmt.Errorf("in line %d: cannot parse %q into silo and key", lineCount, siloAndKey)
-		}
-		datas := silos[silo]
-		if data == "" {
-			if datas != nil {
-				delete(datas, key)
-			}
-		} else {
-			if datas == nil {
-				datas = map[string]string{}
-				silos[silo] = datas
-			}
-			datas[key] = data
+	if len(tx) > 0 {
+		return nil, fmt.Errorf("unfinished tx at end of input")
+	}
+	var records []Record
+	for typ, imap := range timap {
+		for id, data := range imap {
+			records = append(records, Record{typ, id, data})
 		}
 	}
-	err = scanner.Err()
+	sort.Slice(records, func(i, j int) bool {
+		a := records[i]
+		b := records[j]
+		if a.Typ != b.Typ {
+			return a.Typ < b.Typ
+		}
+		return a.Id < b.Id
+	})
+	return records, nil
+}
+
+func parseRecord(line string) (Record, error) {
+	// line = "user 1 data"
+	// line = "user 1"
+	i := strings.IndexRune(line, ' ')
+	if i < 0 {
+		return Record{}, fmt.Errorf("invalid line: first space not found")
+	}
+	typ := line[:i]
+	line = line[i+1:] // id data
+	i = strings.IndexRune(line, ' ')
+	if i < 0 {
+		return Record{typ, line, ""}, nil
+	}
+	id := line[:i]
+	line = line[i+1:] // data
+	return Record{typ, id, line}, nil
+}
+
+// MustAppend is like Append except it panics on error.
+func MustAppend(filename string, records []Record) {
+	err := Append(filename, records)
 	if err != nil {
-		return nil, err
-	}
-	return &fileData{lineCount, silos}, nil
-}
-
-func verifySiloAndKey(silo, key string) {
-	if silo == "" {
-		panic("empty silo")
-	}
-	if strings.ContainsAny(silo, " {}\r\n\t\b") {
-		panic("silo " + silo + "contains invalid characters")
-	}
-	if key == "" {
-		panic("empty key")
-	}
-	if strings.ContainsAny(key, " {}\r\n\t\b") {
-		panic("key " + key + "contains invalid characters")
+		panic(err)
 	}
 }
 
-func marshal(x interface{}) (string, error) {
-	if x == nil {
-		return "", nil
+// Append appends records to a file. Each Append invocation is a transaction.
+// Append returns any error encountered. It is possible that Append appends only
+// a portion of the provided records. In that case the database is corrupted.
+func Append(filename string, records []Record) error {
+	// print records to memory
+	var buf bytes.Buffer
+	var err error
+	for _, rec := range records {
+		if rec.Data == "" {
+			_, err = fmt.Fprintf(&buf, "%s %s\n", rec.Typ, rec.Id)
+		} else {
+			_, err = fmt.Fprintf(&buf, "%s %s %s\n", rec.Typ, rec.Id, rec.Data)
+		}
+		if err != nil {
+			return err
+		}
 	}
-	buf, err := json.Marshal(x)
+	_, err = buf.WriteString("-\n")
 	if err != nil {
-		return "", err
+		return err
 	}
-	return string(buf), nil
+	// write memory buffer to file
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(buf.Bytes())
+	return err
 }
 
-func buildLine(silo, key, data string) string {
-	if data == "" {
-		return fmt.Sprintf("%s %s\n", silo, key)
+func Compact(srcfile, destfile string) error {
+	records, err := Read(srcfile)
+	if err != nil {
+		return err
 	}
-	return fmt.Sprintf("%s %s %s\n", silo, key, data)
+	return Append(destfile, records)
 }
